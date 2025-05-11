@@ -1,0 +1,180 @@
+#cloud-config
+###############################################################################
+# パッケージのアップデートおよびアップグレード
+###############################################################################
+package_update: true                # インスタンス起動時に 'apt-get update' を自動で実行
+package_upgrade: true               # 'apt-get upgrade' も実施
+package_reboot_if_required: false   # upgrade でカーネルが更新されても再起動はしない
+
+# rootユーザーを無効にしない
+disable_root: false                 # root のログイン/パスワードを保持
+
+###############################################################################
+# ホスト名の設定
+###############################################################################
+hostname: proxmox                   # ホスト名を "proxmox" に設定
+fqdn: proxmox.local                 # FQDN を "proxmox.local" に設定（ローカル環境で解決させる例）
+
+###############################################################################
+# Debianのデフォルトユーザーを無効化
+###############################################################################
+users: []                           # cloud-init が生成するデフォルトユーザー 'admin' を無効にする
+
+###############################################################################
+# インストールするパッケージの指定
+###############################################################################
+packages:
+ - dnsmasq                          # 小規模なDNS/DHCPサーバー (ローカルNW 内での名前解決・DHCP 発行に便利)
+ - patch                            # ソースコードやテキストファイルにパッチを当てるためのコマンド
+
+###############################################################################
+# 指定されたファイルの書き込み (patch ファイル、dnsmasq 設定など)
+###############################################################################
+write_files:
+  # ifupdown2 にパッチを当てるためのファイル
+  - path: /run/scheduler.patch
+    owner: root:root
+    permissions: '0644'
+    content: |
+      --- ifupdown2/ifupdown/scheduler-old.py	2022-10-07 16:34:42.000000000 +1300
+      +++ ifupdown2/ifupdown/scheduler.py	2022-10-07 16:34:44.000000000 +1300
+      @@ -127,15 +127,19 @@
+      
+               if ifupdownobj.config.get('addon_scripts_support', '0') == '1':
+                   # /etc/network/ スクリプトを実行する
+      -            os.environ['IFACE'] = ifaceobj.name if ifaceobj.name else ''
+      -            os.environ['LOGICAL'] = ifaceobj.name if ifaceobj.name else ''
+      -            os.environ['METHOD'] = ifaceobj.addr_method if ifaceobj.addr_method else ''
+      -            os.environ['ADDRFAM'] = ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else ''
+      +            command_env = (cenv or {}).copy()
+      +            command_env.update({
+      +                'IFACE': ifaceobj.name if ifaceobj.name else '',
+      +                'LOGICAL': ifaceobj.name if ifaceobj.name else '',
+      +                'METHOD': ifaceobj.addr_method if ifaceobj.addr_method else '',
+      +                'ADDRFAM': ','.join(ifaceobj.addr_family) if ifaceobj.addr_family else '',
+      +            })
+      +
+                   for mname in ifupdownobj.script_ops.get(op, []):
+                       ifupdownobj.logger.debug('%s: %s : running script %s'
+                           %(ifacename, op, mname))
+                       try:
+      -                    utils.exec_command(mname, env=cenv)
+      +                    utils.exec_command(mname, env=command_env)
+                       except Exception as e:
+                           if "permission denied" in str(e).lower():
+                               ifupdownobj.logger.warning('%s: %s %s' % (ifacename, op, str(e)))
+
+  # dnsmasq の設定ファイル (vmbr0 での DHCP 範囲指定など)
+  - path: /etc/dnsmasq.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      interface=vmbr0
+      dhcp-range=10.10.10.2,10.10.10.254,12h
+      dhcp-option=3,10.10.10.1
+
+###############################################################################
+# サーバ起動時 (ブート時) に実行するコマンド (すべての起動で実行)
+###############################################################################
+bootcmd:
+  - sysctl -w net.ipv6.conf.all.disable_ipv6=1       # IPv6を無効にする設定
+  - sysctl -w net.ipv6.conf.default.disable_ipv6=1
+
+###############################################################################
+# 最初の起動時にのみ実行されるコマンド
+###############################################################################
+runcmd:
+  # 環境変数 DEBIAN_FRONTEND の設定 (noninteractive で対話的インストールを抑制)
+  - export DEBIAN_FRONTEND=noninteractive
+
+  #---------------------------------------------------------------------------
+  # Proxmox のリポジトリを追加
+  #---------------------------------------------------------------------------
+  # 無償版の Proxmox VE リポジトリを Debian 12 (bookworm) 用に追加
+  - echo "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
+
+  # Proxmox VE のリリースキーをダウンロードして APT の信頼されたキーとして登録
+  - wget https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+
+  #---------------------------------------------------------------------------
+  # パッケージの更新とフルアップグレード
+  #---------------------------------------------------------------------------
+  - apt update && apt full-upgrade -y
+
+  # postfix の対話設定をスキップするために、事前にインストール設定を仕込んでおく
+  - echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
+
+  #---------------------------------------------------------------------------
+  # パッケージのインストール (設定ファイルは古いものを保持)
+  #---------------------------------------------------------------------------
+  # "proxmox-ve" をはじめ、仮想化に必要なパッケージ類をまとめて導入
+  - apt install proxmox-ve postfix open-iscsi -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y
+
+  #---------------------------------------------------------------------------
+  # ifupdown2へのパッチ適用 (環境変数をフックスクリプトに渡せるようにする)
+  #---------------------------------------------------------------------------
+  - patch /usr/share/ifupdown2/ifupdown/scheduler.py /run/scheduler.patch && rm /run/scheduler.patch
+
+  #---------------------------------------------------------------------------
+  # ifupdown2 が "ADDRFAM=inet,inet6" をフックスクリプトに渡すので、それを修正
+  # (cloud-init の if-pre-up.d/if-post-down.d が inet6 のみと想定していたケースに対応)
+  #---------------------------------------------------------------------------
+  - sed -i'' -e 's/ inet6 / inet,inet6 /' /etc/network/if-pre-up.d/cloud_inet6 /etc/network/if-post-down.d/cloud_inet6
+
+  #---------------------------------------------------------------------------
+  # Proxmox の ifupdown2 は source-directory をサポートしていないため、
+  # source を使用してネットワーク設定を読み込む
+  # (vmbr0 インターフェースのためにゲストのNAT設定を追加)
+  #---------------------------------------------------------------------------
+  # メタデータから取得したMACアドレスと一致する物理NIC (eth0等) を特定して変数に格納
+  - export LOCAL_NET_INTERFACE=$(ip -o link show | grep $(cloud-init query ds.meta_data.mac) | awk '{print $2}' | sed 's/:$//')
+
+  - |
+    echo "
+    # /etc/network/interfaces.d/ からのファイルを読み込む
+    source /etc/network/interfaces.d/*
+
+    # Cloudイメージは新しく追加されたインターフェース用に動的に設定フラグメントを生成
+    source /run/network/interfaces.d/*
+    auto lo
+    iface lo inet loopback
+
+    auto eth0
+    iface eth0 inet dhcp
+
+    auto vmbr0
+    iface vmbr0 inet static
+        # ゲスト用のNATネットワーク
+        address  10.10.10.1/24
+        bridge-ports none
+        bridge-stp off
+        bridge-fd 0
+    
+        post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
+        post-up   iptables -t nat -A POSTROUTING -s '10.10.10.0/24' -o ${LOCAL_NET_INTERFACE} -j MASQUERADE
+        post-down iptables -t nat -D POSTROUTING -s '10.10.10.0/24' -o ${LOCAL_NET_INTERFACE} -j MASQUERADE
+    " > /etc/network/interfaces
+
+  #---------------------------------------------------------------------------
+  # /etc/network/interfaces の設定を適用 (ネットワークサービス再起動)
+  #---------------------------------------------------------------------------
+  - systemctl restart networking.service
+
+  #---------------------------------------------------------------------------
+  # pveproxy の起動と自動起動を有効化
+  # Proxmox VE 管理用の Web インターフェースを提供するデーモン
+  #---------------------------------------------------------------------------
+  - systemctl start pveproxy
+  - systemctl enable pveproxy
+
+  #---------------------------------------------------------------------------
+  # EC2インスタンスのプライベートIP を /etc/hosts に追加
+  # (FQDN解決や hostname 解決が必要な場合の対策)
+  #---------------------------------------------------------------------------
+  - PRIVATE_IP=$(ip addr show ens5 | grep inet | awk '{ print $2 }' | cut -d'/' -f1 | head -n 1)
+  - echo "$PRIVATE_IP proxmox" >> /etc/hosts
+
+  #---------------------------------------------------------------------------
+  # Proxmox の証明書を更新 (WEB管理コンソール用)
+  #---------------------------------------------------------------------------
+  - pvecm updatecerts --force
